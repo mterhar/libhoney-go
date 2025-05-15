@@ -255,6 +255,15 @@ func Init(conf Config) error {
 			UserAgentAddition:    UserAgentAddition,
 			Logger:               clientConf.Logger,
 			Metrics:              sd,
+			RetryConfig: &transmission.RetryConfig{
+				Enabled:             true,
+				MaxRetryCount:       2,
+				InitialInterval:     100 * time.Millisecond,
+				MaxInterval:         500 * time.Millisecond,
+				IntervalMultiplier:  2.0,
+				RandomizationFactor: 0.3,
+				MaxElapsedTime:      1 * time.Minute,
+			},
 		}
 	}
 	clientConf.Transmission = t

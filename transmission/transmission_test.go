@@ -200,6 +200,7 @@ func TestTxSendSingle(t *testing.T) {
 			responses:             make(chan Response, 1),
 			metrics:               &nullMetrics{},
 			enableMsgpackEncoding: doMsgpack,
+			retryConfig:           RetryConfig{Enabled: false}, // Ensure retries are disabled in tests
 		}
 		reset := func(b *batchAgg, frt *FakeRoundTripper, statusCode int, body string, err error) {
 			if body == "" {
@@ -1478,9 +1479,11 @@ func (rt *noRetryAfterRoundTripper) RoundTrip(r *http.Request) (*http.Response, 
 func TestFireBatchRetryAfter(t *testing.T) {
 	// Simulate a 429 with Retry-After, then a 200
 	b := &batchAgg{
-		httpClient: &http.Client{Transport: &retryAfterRoundTripper{startTime: time.Now()}},
-		responses:  make(chan Response, 1),
-		metrics:    &nullMetrics{},
+		httpClient:  &http.Client{Transport: &retryAfterRoundTripper{startTime: time.Now()}},
+		responses:   make(chan Response, 1),
+		metrics:     &nullMetrics{},
+		retryConfig: DefaultRetryConfig(), // Add proper retry configuration
+		logger:      &nullLogger{},
 	}
 	b.Add(&Event{APIHost: "h", APIKey: "k", Dataset: "d", Metadata: "meta"})
 	start := time.Now()
@@ -1496,9 +1499,11 @@ func TestFireBatchRetryAfter(t *testing.T) {
 
 	// Test default 1s sleep if Retry-After is missing
 	b = &batchAgg{
-		httpClient: &http.Client{Transport: &noRetryAfterRoundTripper{startTime: time.Now()}},
-		responses:  make(chan Response, 1),
-		metrics:    &nullMetrics{},
+		httpClient:  &http.Client{Transport: &noRetryAfterRoundTripper{startTime: time.Now()}},
+		responses:   make(chan Response, 1),
+		metrics:     &nullMetrics{},
+		retryConfig: DefaultRetryConfig(), // Add proper retry configuration
+		logger:      &nullLogger{},
 	}
 	b.Add(&Event{APIHost: "h", APIKey: "k", Dataset: "d", Metadata: "meta2"})
 	start = time.Now()
@@ -1510,5 +1515,677 @@ func TestFireBatchRetryAfter(t *testing.T) {
 	delta = time.Since(start)
 	if delta < time.Second {
 		t.Errorf("expected at least 1s delay, got %v", delta)
+	}
+}
+
+// TestRetryConfig tests the RetryConfig functionality including initialization and defaults.
+func TestRetryConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     *RetryConfig
+		expected  RetryConfig
+		wantError bool
+	}{
+		{
+			name:  "nil config uses defaults",
+			input: nil,
+			expected: RetryConfig{
+				Enabled:             true,
+				MaxRetryCount:       defaultMaxRetryCount,
+				InitialInterval:     defaultInitialRetryInterval,
+				MaxInterval:         defaultMaxRetryInterval,
+				IntervalMultiplier:  defaultRetryIntervalMultiplier,
+				RandomizationFactor: defaultRetryRandomizationFactor,
+				MaxElapsedTime:      defaultMaxElapsedTime,
+			},
+		},
+		{
+			name: "partial config fills in defaults",
+			input: &RetryConfig{
+				MaxRetryCount: 10,
+				Enabled:       true,
+			},
+			expected: RetryConfig{
+				Enabled:             true,
+				MaxRetryCount:       10,
+				InitialInterval:     defaultInitialRetryInterval,
+				MaxInterval:         defaultMaxRetryInterval,
+				IntervalMultiplier:  defaultRetryIntervalMultiplier,
+				RandomizationFactor: defaultRetryRandomizationFactor,
+				MaxElapsedTime:      defaultMaxElapsedTime,
+			},
+		},
+		{
+			name: "fully specified config",
+			input: &RetryConfig{
+				Enabled:             false,
+				MaxRetryCount:       3,
+				InitialInterval:     2 * time.Second,
+				MaxInterval:         20 * time.Second,
+				IntervalMultiplier:  3.0,
+				RandomizationFactor: 0.4,
+				MaxElapsedTime:      1 * time.Minute,
+			},
+			expected: RetryConfig{
+				Enabled:             false,
+				MaxRetryCount:       3,
+				InitialInterval:     2 * time.Second,
+				MaxInterval:         20 * time.Second,
+				IntervalMultiplier:  3.0,
+				RandomizationFactor: 0.4,
+				MaxElapsedTime:      1 * time.Minute,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Honeycomb{
+				RetryConfig:  tt.input,
+				MaxBatchSize: 10,                     // Required to avoid "MaxBatchSize and BatchTimeout can't both be zero"
+				BatchTimeout: 100 * time.Millisecond, // Required to avoid "MaxBatchSize and BatchTimeout can't both be zero"
+				Logger:       &nullLogger{},
+				Metrics:      &nullMetrics{},
+				responses:    make(chan Response), // Initialize responses channel
+			}
+
+			err := h.Start()
+			if tt.wantError {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+
+			// Validate the defaults were applied correctly by examining the batchMaker
+			batch := h.batchMaker()
+			batchAgg, ok := batch.(*batchAgg)
+			assert.True(t, ok, "Expected batchMaker to return *batchAgg")
+
+			assert.Equal(t, tt.expected.Enabled, batchAgg.retryConfig.Enabled)
+			assert.Equal(t, tt.expected.MaxRetryCount, batchAgg.retryConfig.MaxRetryCount)
+			assert.Equal(t, tt.expected.InitialInterval, batchAgg.retryConfig.InitialInterval)
+			assert.Equal(t, tt.expected.MaxInterval, batchAgg.retryConfig.MaxInterval)
+			assert.Equal(t, tt.expected.IntervalMultiplier, batchAgg.retryConfig.IntervalMultiplier)
+			assert.Equal(t, tt.expected.RandomizationFactor, batchAgg.retryConfig.RandomizationFactor)
+			assert.Equal(t, tt.expected.MaxElapsedTime, batchAgg.retryConfig.MaxElapsedTime)
+
+			h.Stop()
+		})
+	}
+}
+
+// TestDefaultRetryConfig verifies the default retry configuration
+func TestDefaultRetryConfig(t *testing.T) {
+	config := DefaultRetryConfig()
+
+	assert.Equal(t, true, config.Enabled)
+	assert.Equal(t, defaultMaxRetryCount, config.MaxRetryCount)
+	assert.Equal(t, defaultInitialRetryInterval, config.InitialInterval)
+	assert.Equal(t, defaultMaxRetryInterval, config.MaxInterval)
+	assert.Equal(t, defaultRetryIntervalMultiplier, config.IntervalMultiplier)
+	assert.Equal(t, defaultRetryRandomizationFactor, config.RandomizationFactor)
+	assert.Equal(t, defaultMaxElapsedTime, config.MaxElapsedTime)
+}
+
+// TestCalculateNextBackoff verifies the exponential backoff algorithm with jitter
+func TestCalculateNextBackoff(t *testing.T) {
+	tests := []struct {
+		name        string
+		retryConfig RetryConfig
+		retryCount  int
+		minExpected time.Duration
+		maxExpected time.Duration
+	}{
+		{
+			name: "first retry with defaults",
+			retryConfig: RetryConfig{
+				Enabled:             true,
+				InitialInterval:     time.Second,
+				IntervalMultiplier:  1.5,
+				MaxInterval:         30 * time.Second,
+				RandomizationFactor: 0.5,
+			},
+			retryCount:  0,
+			minExpected: 500 * time.Millisecond,  // Initial * (1 - Factor)
+			maxExpected: 1500 * time.Millisecond, // Initial * (1 + Factor)
+		},
+		{
+			name: "third retry with defaults",
+			retryConfig: RetryConfig{
+				Enabled:             true,
+				InitialInterval:     time.Second,
+				IntervalMultiplier:  1.5,
+				MaxInterval:         30 * time.Second,
+				RandomizationFactor: 0.5,
+			},
+			retryCount:  2,
+			minExpected: 1125 * time.Millisecond, // Initial * Multiplier^2 * (1 - Factor)
+			maxExpected: 3375 * time.Millisecond, // Initial * Multiplier^2 * (1 + Factor)
+		},
+		{
+			name: "respect max interval",
+			retryConfig: RetryConfig{
+				Enabled:             true,
+				InitialInterval:     10 * time.Second,
+				IntervalMultiplier:  2.0,
+				MaxInterval:         15 * time.Second,
+				RandomizationFactor: 0.5,
+			},
+			retryCount:  3,                        // Would be 10 * 2^3 = 80s without max
+			minExpected: 7500 * time.Millisecond,  // MaxInterval * (1 - Factor)
+			maxExpected: 22500 * time.Millisecond, // MaxInterval * (1 + Factor)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &batchAgg{
+				retryConfig: tt.retryConfig,
+			}
+
+			// Call the function multiple times to verify it's deterministic
+			for i := 0; i < 100; i++ {
+				backoff := b.calculateNextBackoff(tt.retryCount)
+
+				assert.GreaterOrEqual(t, backoff, tt.minExpected,
+					"Backoff %v is less than minimum expected %v", backoff, tt.minExpected)
+				assert.LessOrEqual(t, backoff, tt.maxExpected,
+					"Backoff %v is greater than maximum expected %v", backoff, tt.maxExpected)
+			}
+		})
+	}
+}
+
+// Custom HTTP Client that records request history
+type recordingTransport struct {
+	responses []*http.Response
+	errors    []error
+	requests  []*http.Request
+	reqIndex  int
+	callCount int
+	callDelay time.Duration // Optional delay to simulate slow network
+	mu        sync.Mutex
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.requests = append(t.requests, req)
+	t.callCount++
+
+	if t.callDelay > 0 {
+		time.Sleep(t.callDelay)
+	}
+
+	if t.reqIndex < len(t.responses) {
+		resp := t.responses[t.reqIndex]
+		err := t.errors[t.reqIndex]
+		t.reqIndex++
+		return resp, err
+	}
+
+	// Default to 503 if no responses left
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader("service unavailable")),
+	}, nil
+}
+
+// TestMaxElapsedTime verifies that retries are limited by max elapsed time
+func TestMaxElapsedTime(t *testing.T) {
+	// Only check that we get an error with max elapsed time in the message
+	responses := make([]*http.Response, 20)
+	errors := make([]error, 20)
+
+	// All responses will be 503 Service Unavailable
+	for i := 0; i < 20; i++ {
+		responses[i] = &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader("service unavailable")),
+			Header:     http.Header{},
+		}
+		errors[i] = nil
+	}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+		responses: make(chan Response, 1),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{},
+		retryConfig: RetryConfig{
+			Enabled:             true,
+			MaxRetryCount:       15,
+			InitialInterval:     time.Millisecond,
+			MaxInterval:         time.Millisecond * 10,
+			IntervalMultiplier:  1.5,
+			RandomizationFactor: 0.1,
+			MaxElapsedTime:      time.Millisecond, // Very short to force max elapsed time error immediately
+		},
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value",
+		},
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// Get the response from the channel
+	var resp Response
+	select {
+	case resp = <-b.responses:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for response")
+	}
+
+	// Don't check the call count as it may vary by implementation
+	// Just verify we got an error with "max elapsed time" in it
+	assert.NotNil(t, resp.Err, "Expected error in response")
+	assert.Contains(t, resp.Err.Error(), "max elapsed time",
+		"Expected error about max elapsed time, got: %v", resp.Err)
+}
+
+// TestRetryCount verifies retry count limiting
+func TestRetryCount(t *testing.T) {
+	responses := make([]*http.Response, 10)
+	errors := make([]error, 10)
+
+	// All responses will be 503 Service Unavailable
+	for i := 0; i < 10; i++ {
+		responses[i] = &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader("service unavailable")),
+			Header:     http.Header{},
+		}
+		errors[i] = nil
+	}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	maxRetries := 3
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+		responses: make(chan Response, 1),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{},
+		retryConfig: RetryConfig{
+			Enabled:             true,
+			MaxRetryCount:       maxRetries,
+			InitialInterval:     1 * time.Millisecond, // Use small intervals for faster tests
+			MaxInterval:         5 * time.Millisecond,
+			IntervalMultiplier:  1.5,
+			RandomizationFactor: 0.1,
+			MaxElapsedTime:      1 * time.Hour, // Very long to ensure MaxRetryCount is the limiting factor
+		},
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value",
+		},
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// We should have exactly maxRetries+1 calls (initial + retries)
+	assert.Equal(t, maxRetries+1, transport.callCount,
+		"Expected %d HTTP calls with a max retry count of %d, got %d",
+		maxRetries+1, maxRetries, transport.callCount)
+}
+
+// TestRetryWithSuccess verifies successful retry after temporary failures
+func TestRetryWithSuccess(t *testing.T) {
+	responses := []*http.Response{
+		{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader("too many requests")),
+			Header:     http.Header{"Retry-After": {"0.001"}}, // 1ms retry delay
+		},
+		{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader("service unavailable")),
+			Header:     http.Header{},
+		},
+		{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`[{"status":202}]`)),
+			Header:     http.Header{"Content-Type": {"application/json"}},
+		},
+	}
+	errors := []error{nil, nil, nil}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+
+		responses: make(chan Response, 1),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{},
+		retryConfig: RetryConfig{
+			Enabled:             true,
+			MaxRetryCount:       5,
+			InitialInterval:     1 * time.Millisecond, // Very short for fast tests
+			MaxInterval:         5 * time.Millisecond, // Very short for fast tests
+			IntervalMultiplier:  1.5,
+			RandomizationFactor: 0.1,
+			MaxElapsedTime:      30 * time.Second, // Much longer to ensure we complete the test
+		},
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value",
+		},
+		Metadata: "test-metadata",
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// We should have exactly 3 calls (initial + 2 retries before success)
+	assert.Equal(t, 3, transport.callCount,
+		"Expected 3 HTTP calls before success, got %d", transport.callCount)
+
+	// Get the response from the channel
+	var resp Response
+	select {
+	case resp = <-b.responses:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for response")
+	}
+
+	// Verify the response is as expected
+	assert.Equal(t, 202, resp.StatusCode, "Expected status code 202")
+	assert.Nil(t, resp.Err, "Expected no error from successful request")
+	assert.Equal(t, "test-metadata", resp.Metadata, "Expected metadata to match")
+}
+
+// TestDisabledRetries verifies that when retries are disabled,
+// only the first retry is done (to maintain legacy behavior)
+func TestDisabledRetries(t *testing.T) {
+	firstResponse := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader("service unavailable")),
+		Header:     http.Header{},
+	}
+	secondResponse := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`[{"status":200}]`)),
+		Header:     http.Header{"Content-Type": {"application/json"}},
+	}
+
+	responses := []*http.Response{firstResponse, secondResponse}
+	errors := []error{nil, nil}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+		responses: make(chan Response, 2),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{},
+		retryConfig: RetryConfig{
+			Enabled: false, // Retries disabled - should work with just this field
+		},
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value1234",
+		},
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// We should have exactly 1 call when retries are disabled (except for timeout errors)
+	assert.Equal(t, 1, transport.callCount,
+		"Expected 1 HTTP call with retries disabled, got %d", transport.callCount)
+
+	// Get the response from the channel
+	var resp Response
+	select {
+	case resp = <-b.responses:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for response")
+	}
+
+	// Verify we get the expected status code
+	assert.Equal(t, resp.StatusCode, http.StatusServiceUnavailable, "Should receive 503 response with retries disabled")
+}
+
+func TestOmittedRetries(t *testing.T) {
+	firstResponse := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader("service unavailable")),
+		Header:     http.Header{},
+	}
+	secondResponse := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`[{"status":200}]`)),
+		Header:     http.Header{"Content-Type": {"application/json"}},
+	}
+
+	responses := []*http.Response{firstResponse, secondResponse}
+	errors := []error{nil, nil}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+		responses: make(chan Response, 1),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{}, // no retryConfig block at all.
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value",
+		},
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// We should have exactly 2 calls (initial + 1 retry) with retries disabled
+	assert.Equal(t, 1, transport.callCount,
+		"Expected 1 HTTP calls with retries disabled, got %d", transport.callCount)
+
+	// Get the response from the channel
+	var resp Response
+	select {
+	case resp = <-b.responses:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for response")
+	}
+
+	assert.Equal(t, resp.StatusCode, http.StatusServiceUnavailable, "failed second response")
+}
+
+func TestFailedRetries(t *testing.T) {
+	firstResponse := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader("service unavailable")),
+		Header:     http.Header{},
+	}
+	secondResponse := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`[{"status":200}]`)),
+		Header:     http.Header{"Content-Type": {"application/json"}},
+	}
+
+	responses := []*http.Response{firstResponse, secondResponse}
+	errors := []error{nil, nil}
+
+	transport := &recordingTransport{
+		responses: responses,
+		errors:    errors,
+	}
+
+	b := &batchAgg{
+		batches: map[string][]*Event{},
+		httpClient: &http.Client{
+			Transport: transport,
+		},
+		responses: make(chan Response, 1),
+		metrics:   &nullMetrics{},
+		logger:    &nullLogger{}, // no retryConfig block at all.
+	}
+
+	event := &Event{
+		APIHost: "http://example.com",
+		APIKey:  "apikey",
+		Dataset: "test",
+		Data: map[string]interface{}{
+			"field": "value",
+		},
+	}
+
+	// Run the batch fireBatch method
+	b.Add(event)
+	b.Fire(&testNotifier{})
+
+	// We should have exactly 2 calls (initial + 1 retry) with retries disabled
+	assert.Equal(t, 1, transport.callCount,
+		"Expected 1 HTTP calls with retries disabled, got %d", transport.callCount)
+
+	// Get the response from the channel
+	var resp Response
+	select {
+	case resp = <-b.responses:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Timed out waiting for response")
+	}
+
+	// Verify the third response isn't tried
+	assert.Equal(t, resp.StatusCode, http.StatusServiceUnavailable, "failed second response")
+}
+
+// TestShouldRetry verifies the retry logic correctly identifies retryable errors
+func TestShouldRetry(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		statusCode int
+		expected   bool
+	}{
+		{
+			name:       "timeout error should retry",
+			err:        &timeoutErr{},
+			statusCode: 0,
+			expected:   true,
+		},
+		{
+			name:       "429 should retry",
+			err:        nil,
+			statusCode: http.StatusTooManyRequests,
+			expected:   true,
+		},
+		{
+			name:       "503 should retry",
+			err:        nil,
+			statusCode: http.StatusServiceUnavailable,
+			expected:   true,
+		},
+		{
+			name:       "502 should retry",
+			err:        nil,
+			statusCode: http.StatusBadGateway,
+			expected:   true,
+		},
+		{
+			name:       "504 should retry",
+			err:        nil,
+			statusCode: http.StatusGatewayTimeout,
+			expected:   true,
+		},
+		{
+			name:       "500 should retry",
+			err:        nil,
+			statusCode: http.StatusInternalServerError,
+			expected:   true,
+		},
+		{
+			name:       "400 should not retry",
+			err:        nil,
+			statusCode: http.StatusBadRequest,
+			expected:   false,
+		},
+		{
+			name:       "401 should not retry",
+			err:        nil,
+			statusCode: http.StatusUnauthorized,
+			expected:   false,
+		},
+		{
+			name:       "test error should not retry",
+			err:        errors.New("testing error handling"),
+			statusCode: 0,
+			expected:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := shouldRetry(tt.err, tt.statusCode)
+			assert.Equal(t, tt.expected, result, "shouldRetry(%v, %d) should be %v", tt.err, tt.statusCode, tt.expected)
+		})
 	}
 }
